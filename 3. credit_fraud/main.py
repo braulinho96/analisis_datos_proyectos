@@ -12,7 +12,10 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder  
 from imblearn.under_sampling import RandomUnderSampler
 from imblearn.over_sampling import SMOTE
-from sklearn.tree import DecisionTreeClassifier
+from sklearn.tree import DecisionTreeClassifier, plot_tree
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
 
 sns.set_theme(style="whitegrid")
 plt.rcParams['figure.figsize'] = (10, 6)
@@ -28,16 +31,8 @@ def haversine_vectorized(lon1, lat1, lon2, lat2):
     r = 6371 # Radio de la tierra en km
     return c * r
 
-def cramers_v(confusion_matrix):
-    """Calcula la fuerza de asociación (0 a 1)"""
-    chi2 = stats.chi2_contingency(confusion_matrix)[0]
-    n = confusion_matrix.sum().sum()
-    phi2 = chi2 / n
-    r, k = confusion_matrix.shape
-    return np.sqrt(phi2 / min(k-1, r-1))
-
 # Cargar datos
-df = pd.read_csv('credit_fraud/fraudTest.csv')
+df = pd.read_csv('3. credit_fraud/fraudTest.csv')
 
 # --- 1. Extraemos variables importantes a partir del dataset ---
 
@@ -80,63 +75,47 @@ else:
 
 print(f"\n--- B: MATRIZ DE CORRELACIÓN númerica ({method_corr.upper()}) ---")
 
-# Incluimos coordenadas para ver su redundancia con distance_km
+# ----------------- Correlacion de Spearman debido a variables no normales y por la cantidad de datos
 cols_corr = ['amt', 'age', 'distance_km', 'city_pop', 'lat', 'long', 'merch_lat', 'merch_long']
 corr_matrix = df[cols_corr].corr(method=method_corr)
 plt.figure(figsize=(10, 8))
 sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', fmt=".2f", vmin=-1, vmax=1)
 plt.title(f'Matriz de Correlación ({method_corr.capitalize()})')
-plt.show()
+plt.savefig('correlation_matrix.png')
+plt.close()
 
+# ==============================================================================
+# PRUEBAS DE HIPÓTESIS (Relación con el Fraude)
+# Objetivo: Validar si la variable distingue entre Fraude (1) y No Fraude (0)
+# ==============================================================================
+print("\n--- PASO 3: PRUEBAS DE SIGNIFICANCIA (Variables vs Target) ---")
 
-
-# --- 3. VARIABLES NUMÉRICAS VS FRAUDE (Mann-Whitney U + Rank Biserial) ---
-print("\n--- B. Comparación Numérica (Fraude vs No Fraude) ---")
-numeric_cols = ['amt', 'distance_km', 'age', 'city_pop']
+# A. VARIABLES NUMÉRICAS (Mann-Whitney U, debido a su distribucion no normal)
+print(">>> A. Numéricas: Mann-Whitney U Test")
 fraude = df[df['is_fraud'] == 1]
 no_fraude = df[df['is_fraud'] == 0]
 
-results_num = []
-
-for col in numeric_cols:
-    # Mann-Whitney U (Prueba de mediana para datos no paramétricos)
-    stat, p = stats.mannwhitneyu(fraude[col], no_fraude[col], alternative='two-sided')
-    
-    # Calculamos la correlación Rank-Biserial (Tamaño del efecto)
-    # Fórmula simplificada aproximada para grandes volúmenes o usar bibliotecas externas
-    # Aquí reportamos la diferencia de medianas que es más interpretable
-    median_diff = fraude[col].median() - no_fraude[col].median()
-    
-    results_num.append({
+stats_results = []
+for col in ['amt', 'distance_km', 'age', 'city_pop', 'lat', 'long', 'merch_lat', 'merch_long']:
+    stat, p = stats.mannwhitneyu(fraude[col], no_fraude[col])
+    # Calculamos diferencia de medianas para ver el "tamaño del efecto" real
+    diff_mediana = fraude[col].median() - no_fraude[col].median()
+    stats_results.append({
         'Variable': col,
-        'Median_Fraud': fraude[col].median(),
-        'Median_Legit': no_fraude[col].median(),
         'P-Value': p,
-        'Significant': p < 0.05
+        'Es Significativo?': 'SÍ' if p < 0.05 else 'NO',
+        'Diferencia Medianas': diff_mediana
     })
 
-df_res_num = pd.DataFrame(results_num)
-print(df_res_num)
+print(pd.DataFrame(stats_results))
 
-# --- 4. VARIABLES CATEGÓRICAS VS FRAUDE (Chi-Cuadrado + V de Cramér) ---
-print("\n--- C. Asociación Categórica (Chi-Cuadrado + V de Cramér) ---")
-cat_cols = ['category', 'gender', 'day_of_week', 'state'] 
-results_cat = []
-
-for col in cat_cols:
+# B. VARIABLES CATEGÓRICAS (Chi-Cuadrado)
+print("\n>>> B. Categóricas: Chi-Cuadrado de Independencia")
+# Probamos Gender y Category
+for col in ['gender', 'category', 'state', 'job', 'day_of_week']:
     contingency = pd.crosstab(df[col], df['is_fraud'])
-    chi2, p, dof, expected = stats.chi2_contingency(contingency)
-    strength = cramers_v(contingency)
-    results_cat.append({
-        'Variable': col,
-        'Chi2': chi2,
-        'P-Value': p,
-        'Cramers_V': strength,
-        'Significant': p < 0.05
-    })
-
-df_res_cat = pd.DataFrame(results_cat)
-print(df_res_cat)
+    chi2, p, dof, ex = stats.chi2_contingency(contingency)
+    print(f"Variable '{col}': p-value={p:.4e} -> {'Significativo' if p < 0.05 else 'Independiente (Borrar)'}")
 
 # =================== Eliminar variables en base a la importancia y análisis previo
 
@@ -156,7 +135,7 @@ sc = StandardScaler()
 sc.fit(X)
 X = pd.DataFrame(sc.transform(X),columns=X.columns)
 
-# ============================= Aplicar Submuestreo Aleatorio para balancear las clases
+# ============================= Aplicar Under Sampling para balancear las clases
 print("\n--- Logistic Regression con Under Sampling ---")
 ru = RandomUnderSampler()
 ru_x,ru_y =ru.fit_resample(X,Y)
@@ -173,7 +152,7 @@ print("Precision:", precision_score(y_test,lr.predict(x_test))*100)
 print("Recall:", recall_score(y_test,lr.predict(x_test))*100)
 print("F1 Score:", f1_score(y_test,lr.predict(x_test))*100)
 
-# ============================= Aplicar Submuestreo Aleatorio para balancear las clases
+# ============================= Aplicar Over sampling para balancear las clases
 print("\n--- Logistic Regression con Over Sampling (SMOTE) ---")
 sm = SMOTE()
 x_s,y_s = sm.fit_resample(X,Y)
@@ -192,7 +171,17 @@ print("F1 Score:", f1_score(y_test_s,lr.predict(x_test_s))*100)
 
 # Under sampling
 print("\n--- Decision Tree Classifier con Under Sampling ---")
-dt = DecisionTreeClassifier()
+dt = DecisionTreeClassifier(random_state=42)
+dt.fit(x_train,y_train)
+cf_4 = confusion_matrix(y_test,dt.predict(x_test))
+print(sns.heatmap(cf_4,annot=True))
+print("Precision:", precision_score(y_test,dt.predict(x_test))*100)
+print("Recall:", recall_score(y_test,dt.predict(x_test))*100)
+print("F1 Score:", f1_score(y_test,dt.predict(x_test))*100)
+
+# Over sampling
+print("\n--- Decision Tree Classifier con Over Sampling ---")
+dt = DecisionTreeClassifier(random_state=42)
 dt.fit(x_train_s,y_train_s)
 cf_3 = confusion_matrix(y_test_s,dt.predict(x_test_s))
 print(sns.heatmap(cf_3,annot=True))
@@ -200,14 +189,43 @@ print("Precision:", precision_score(y_test_s,dt.predict(x_test_s))*100)
 print("Recall:", recall_score(y_test_s,dt.predict(x_test_s))*100)
 print("F1 Score:", f1_score(y_test_s,dt.predict(x_test_s))*100)
 
-# Over sampling
-print("\n--- Decision Tree Classifier con Over Sampling ---")
-dt = DecisionTreeClassifier()
-dt.fit(x_train,y_train)
-cf_4 = confusion_matrix(y_test,dt.predict(x_test))
-print(sns.heatmap(cf_4,annot=True))
-print("Precision:", precision_score(y_test,dt.predict(x_test))*100)
-print("Recall:", recall_score(y_test,dt.predict(x_test))*100)
-print("F1 Score:", f1_score(y_test,dt.predict(x_test))*100)
+# ============================= Graficamos el arbol de decision logradio
+#plt.figure(figsize=(20, 10))
+# Visualizar el árbol entrenado con UnderSampling (es más fácil de leer)
+#plot_tree(dt, 
+#          feature_names=X.columns,       # Nombres de tus variables (amt, age, etc.)
+#          class_names=['No Fraude', 'Fraude'], # Etiquetas (0, 1)
+#          filled=True,                   # Colores (Azul=Fraude, Naranja=No Fraude usualmente)
+#          rounded=True, 
+#          fontsize=10)
+#plt.title("Árbol de Decisión para Detección de Fraude (Reglas Aprendidas)")
+#plt.show()
+
+#  ============================= Comparacion con una neurona clasificadora usando tensorflow keras
+model = keras.Sequential([
+    layers.Dense(16, activation='relu', input_shape=(X.shape[1],)),
+    layers.Dense(8, activation='relu'),
+    layers.Dense(1, activation='sigmoid')
+])
+model.compile(optimizer='adam',
+              loss='binary_crossentropy',
+              metrics=['accuracy'])
+
+model.fit(x_train_s, 
+          y_train_s, 
+          epochs=10, 
+          batch_size=32, 
+          validation_split=0.2)
+
+loss, accuracy = model.evaluate(x_test_s, y_test_s)
+
+print(f"Neurona Clasificadora - Pérdida: {loss:.4f}, Precisión: {accuracy*100:.2f}%")
+# Predicciones y matriz de confusión
+y_pred_keras = (model.predict(x_test_s) > 0.5).astype("int32")
+cf_keras = confusion_matrix(y_test_s, y_pred_keras)
+print(sns.heatmap(cf_keras, annot=True))
+print("Precision:", precision_score(y_test_s, y_pred_keras)*100)
+print("Recall:", recall_score(y_test_s, y_pred_keras)*100)
+print("F1 Score:", f1_score(y_test_s, y_pred_keras)*100)
 
 
