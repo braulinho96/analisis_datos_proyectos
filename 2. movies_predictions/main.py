@@ -54,7 +54,6 @@ plt.title('Distribución Original (Duración)')
 # Esto ayuda a que el modelo no se obsesione con pelis extremadamente largas o cortas
 df_clean['log_minute'] = np.log1p(df_clean['minute'])
 
-
 # CORRELACIÓN
 # Veamos si las variables numéricas se hablan entre sí
 plt.figure(figsize=(6, 5))
@@ -65,9 +64,9 @@ plt.show()
 plt.close()
 
 # ---------------------------------------------------------
-# 6. FEATURE ENGINEERING & SELECTION
+# FEATURE ENGINEERING & SELECTION
 # ---------------------------------------------------------
-print("\n--- 6. PROCESAMIENTO Y SELECCIÓN ---")
+print("\n--- PROCESAMIENTO Y SELECCIÓN ---")
 
 # A. Variables Numéricas (Usamos log_minute en vez de minute)
 X_num = df_clean[['date', 'log_minute']].values
