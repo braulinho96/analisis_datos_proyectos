@@ -16,7 +16,6 @@ from sklearn.tree import DecisionTreeClassifier, plot_tree
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
-# Nota: Lamb no suele estar en keras.optimizers estándar, verifica si necesitas tensorflow_addons
 from tensorflow.keras.optimizers import RMSprop, Adam, Lamb
 import kagglehub
 from kagglehub import KaggleDatasetAdapter
@@ -48,7 +47,7 @@ except Exception as e:
     print("Error cargando kagglehub, asegúrate de tener los datos:", e)
     # df = pd.read_csv("fraudTest.csv") # Descomentar si usas local
 
-# --- Extraemos variables importantes a partir del dataset ---
+# ======================== Extraemos variables importantes a partir del dataset ---
 
 # Convertir fechas
 df['trans_date_trans_time'] = pd.to_datetime(df['trans_date_trans_time'], format='mixed')
@@ -64,8 +63,8 @@ df['day_of_week'] = df['trans_date_trans_time'].dt.day_name()
 # Función para calcular distancia Haversine 
 df['distance_km'] = haversine_vectorized(df['long'], df['lat'], df['merch_long'], df['merch_lat'])
 print("Variables creadas: age, hour, day_of_week, distance_km")
-
-# --- Pruebas de normalidad ---
+# ======================== Exploracion inicial de datos ========================
+# ======================== Pruebas de normalidad
 print("\n--- Prueba de Normalidad (Kolmogorov-Smirnov) ---")
 
 numeric_vars = ['amt', 'distance_km', 'age', 'city_pop']
@@ -87,13 +86,13 @@ else:
 
 print(f"\n--- Matriz de correlacion ({method_corr.upper()}) ---")
 
-# ----------------- Correlacion 
-cols_corr = ['amt', 'age', 'distance_km', 'city_pop', 'lat', 'long', 'merch_lat', 'merch_long']
+# ======================== Correlacion 
+cols_corr = ['amt', 'age', 'distance_km', 'city_pop', 'lat', 'long', 'merch_lat', 'merch_long', 'zip', 'hour']
 corr_matrix = df[cols_corr].corr(method=method_corr)
 plt.figure(figsize=(10, 8))
 sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', fmt=".2f", vmin=-1, vmax=1)
 plt.title(f'Matriz de Correlación ({method_corr.capitalize()})')
-# plt.savefig('3. credit_fraud/correlation_matrix.png')
+plt.savefig('3. credit_fraud/correlation_matrix.png')
 plt.close()
 
 # ======================== Pruebas de hipotesis estadisticas 
@@ -105,7 +104,7 @@ fraude = df[df['is_fraud'] == 1]
 no_fraude = df[df['is_fraud'] == 0]
 
 stats_results = []
-for col in ['amt', 'distance_km', 'age', 'city_pop', 'lat', 'long', 'merch_lat', 'merch_long']:
+for col in ['amt', 'distance_km', 'age', 'city_pop', 'lat', 'long', 'merch_lat', 'merch_long', 'zip', 'hour']:
     stat, p = stats.mannwhitneyu(fraude[col], no_fraude[col])
     diff_mediana = fraude[col].median() - no_fraude[col].median()
     stats_results.append({
@@ -126,7 +125,7 @@ for col in ['gender', 'category', 'state', 'job', 'day_of_week']:
 
 # =================== Eliminar variables ===================
 
-df.drop(columns=["first","last","gender","street","dob","unix_time","city","state","sn","merchant","trans_num","cc_num","trans_date_trans_time", "lat", "merch_lat", "distance_km"],inplace=True)
+df.drop(columns=["first","last","gender","street","dob","unix_time","city","state","sn","merchant","trans_num","cc_num","trans_date_trans_time", "long", "merch_long", 'distance_km','zip'],inplace=True)
 
 # Codificar variable categóricas
 le = LabelEncoder()
@@ -139,44 +138,34 @@ for col in cat_cols_toEncode:
 X = df.drop(columns=["is_fraud"])
 Y = df["is_fraud"] 
 
-# ==============================================================================
-# SECCIÓN CRÍTICA DE PRE-PROCESAMIENTO (CORREGIDA)
-# ==============================================================================
-# Hacemos el Split y el Scaling UNA sola vez para asegurar consistencia
-# y evitar Data Leakage en todos los modelos subsiguientes.
-
-print("\n--- PREPARANDO DATOS (SPLIT & SCALE GLOBAL) ---")
-
-# 1. SPLIT: Separamos Train (80%) y Test (20%) - EL TEST ES SAGRADO
+# ================== PRE-PROCESAMIENTO
 x_train_global, x_test_global, y_train_global, y_test_global = train_test_split(
-    X, Y, test_size=0.2, random_state=42, stratify=Y
-)
+    X, Y, 
+    test_size=0.2, 
+    random_state=42, 
+    stratify=Y)
 
-# 2. SCALING: Ajustamos (fit) solo con Train, transformamos ambos
 sc = StandardScaler()
 x_train_sc = sc.fit_transform(x_train_global)
-x_test_sc = sc.transform(x_test_global) # Este se usará para evaluar TODOS los modelos
+x_test_sc = sc.transform(x_test_global)
 
-# 3. PREPARAR DATASETS PARA TÉCNICAS DE SAMPLING (Solo modificamos el Train)
-
-# A. Under Sampling (Para usar luego)
+# Under Sampling 
 us = RandomUnderSampler(random_state=42)
 x_train_us, y_train_us = us.fit_resample(x_train_sc, y_train_global)
 print(f"Dimensiones UnderSampling Train: {x_train_us.shape}")
 
-# B. Over Sampling SMOTE (Para usar luego)
+# Over Sampling SMOTE
 sm = SMOTE(random_state=42)
 x_train_sm, y_train_sm = sm.fit_resample(x_train_sc, y_train_global)
 print(f"Dimensiones SMOTE Train: {x_train_sm.shape}")
 print("-" * 50)
 
-
 # ============================= Logistic Regression con class_weight='balanced'
 print("\n--- Logistic Regression con class_weight='balanced' ---")
 
 lr_bal = LogisticRegression(class_weight="balanced", max_iter=1000, random_state=42)
-lr_bal.fit(x_train_sc, y_train_global) # Entrenamos con datos escalados originales
-y_pred_bal = lr_bal.predict(x_test_sc) # Evaluamos con test escalado original
+lr_bal.fit(x_train_sc, y_train_global) 
+y_pred_bal = lr_bal.predict(x_test_sc)
 
 print(confusion_matrix(y_test_global, y_pred_bal))
 print("Precision:", precision_score(y_test_global, y_pred_bal)*100)
@@ -198,15 +187,14 @@ for t in [0.1, 0.2, 0.3, 0.4, 0.5]:
 # ============================= Logistic Regression con Under Sampling
 print("\n--- Logistic Regression con Under Sampling ---")
 
-# Usamos los datos ya preparados arriba (x_train_us)
 lr_us = LogisticRegression(max_iter=1000)
 lr_us.fit(x_train_us, y_train_us)
 
-y_pred_us = lr_us.predict(x_test_sc) # Evaluamos en el test real
+y_pred_us = lr_us.predict(x_test_sc) 
 cf = confusion_matrix(y_test_global, y_pred_us)
 
 print(cf)
-# sns.heatmap(cf, annot=True, fmt='d') # Descomenta si quieres ver el gráfico
+# sns.heatmap(cf, annot=True, fmt='d') 
 # plt.show()
 
 print("Precision:", precision_score(y_test_global, y_pred_us)*100)
@@ -268,8 +256,6 @@ print("F1 Score:", f1_score(y_test_global, y_pred_dt_s)*100)
 
 #  ============================= Comparacion con una neurona clasificadora 
 
-# Usando Under Sampling (Tal como indicaba el comentario original)
-# IMPORTANTE: Definimos los optimizadores disponibles
 algoritmos_optimizacion = {
         'RMSprop': RMSprop(learning_rate=0.001),
         'Adam': Adam(learning_rate=0.001),
@@ -320,8 +306,6 @@ for nombre_opt, optimizador in algoritmos_optimizacion.items():
 print("\n--- Resultados Comparativos de Optimizadores (Keras) ---")
 print(pd.DataFrame(resultados_keras))
 
-
-
 # ================== RANDOM FOREST CLASSIFIER CON CLASS WEIGHT BALANCED
 print("\n--- Random Forest con Class Weight Balanced ---")
 
@@ -351,7 +335,6 @@ weights = class_weight.compute_class_weight(
 )
 dict_weights = {0: weights[0], 1: weights[1]}
 
-# 2. Definir una arquitectura un poco más robusta
 model_weighted = keras.Sequential([
     layers.Input(shape=(x_train_sc.shape[1],)),
     layers.Dense(32, activation='relu'),
@@ -363,7 +346,6 @@ model_weighted = keras.Sequential([
 
 model_weighted.compile(optimizer='adam', loss='binary_crossentropy', metrics=['AUC'])
 
-# 3. Entrenar con el dataset COMPLETO y los pesos
 model_weighted.fit(
     x_train_sc, y_train_global,
     epochs=50,
@@ -373,7 +355,6 @@ model_weighted.fit(
     verbose=0
 )
 
-# 4. Evaluación
 y_pred_nn = (model_weighted.predict(x_test_sc) > 0.5).astype(int)
 print(classification_report(y_test_global, y_pred_nn))
 print("Precision:", precision_score(y_test_global, y_pred_nn)*100)

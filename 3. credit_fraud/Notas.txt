@@ -1,0 +1,7 @@
+
+
+
+Seleccion del Threshold
+Variar el valor de threshold puede mejorar dependiendo del problema
+
+Utilizamos curvas ROC y PR para evaluar el trade-off entre falsos pos
