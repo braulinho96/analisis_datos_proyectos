@@ -2,37 +2,34 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+import tensorflow as tf
+import kagglehub
+import os
 from scipy import stats
-from math import radians, cos, sin, asin, sqrt
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import RobustScaler, StandardScaler
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import classification_report, confusion_matrix, f1_score, precision_score, recall_score, roc_auc_score
+from sklearn.metrics import classification_report, confusion_matrix, f1_score, precision_score, recall_score,  roc_auc_score, roc_curve, precision_recall_curve, average_precision_score
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder  
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import LabelEncoder
+from sklearn.inspection import permutation_importance
+from sklearn.utils import class_weight
+from sklearn.metrics import f1_score
 from imblearn.under_sampling import RandomUnderSampler
 from imblearn.over_sampling import SMOTE
 from sklearn.tree import DecisionTreeClassifier, plot_tree
-import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras import layers
 from tensorflow.keras.optimizers import RMSprop, Adam, Lamb
-import kagglehub
+from tensorflow.keras import Sequential, layers, metrics, callbacks
 from kagglehub import KaggleDatasetAdapter
-from sklearn.utils import class_weight
+from torch import neg
+
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+
 
 sns.set_theme(style="whitegrid")
 plt.rcParams['figure.figsize'] = (10, 6)
-
-# Distancia Haversine para las coordenadas geograficas
-def haversine_vectorized(lon1, lat1, lon2, lat2):
-    lon1, lat1, lon2, lat2 = map(np.radians, [lon1, lat1, lon2, lat2])
-    dlon = lon2 - lon1 
-    dlat = lat2 - lat1 
-    a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
-    c = 2 * np.arcsin(np.sqrt(a)) 
-    r = 6371 # Radio de la tierra en km
-    return c * r
 
 # Cargar el dataset desde Kaggle usando kagglehub
 file_path = "fraudTest.csv"
@@ -45,320 +42,304 @@ try:
     print("Datos cargados. Dimensiones del dataset:", df.shape)
 except Exception as e:
     print("Error cargando kagglehub, asegúrate de tener los datos:", e)
-    # df = pd.read_csv("fraudTest.csv") # Descomentar si usas local
 
-# ======================== Extraemos variables importantes a partir del dataset ---
+# df = pd.read_csv("fraudTest.csv") # Descomentar si usas local
+
+# --- Extraemos variables importantes a partir del dataset ---
 
 # Convertir fechas
 df['trans_date_trans_time'] = pd.to_datetime(df['trans_date_trans_time'], format='mixed')
 df['dob'] = pd.to_datetime(df['dob'], format='mixed')
-
-# Calcular edad 
 df['age'] = (df['trans_date_trans_time'] - df['dob']).dt.days // 365
-
-# Extraer hora y dia
 df['hour'] = df['trans_date_trans_time'].dt.hour
 df['day_of_week'] = df['trans_date_trans_time'].dt.day_name()
 
-# Función para calcular distancia Haversine 
-df['distance_km'] = haversine_vectorized(df['long'], df['lat'], df['merch_long'], df['merch_lat'])
-print("Variables creadas: age, hour, day_of_week, distance_km")
-# ======================== Exploracion inicial de datos ========================
-# ======================== Pruebas de normalidad
-print("\n--- Prueba de Normalidad (Kolmogorov-Smirnov) ---")
+# Ordenamos por tarjeta y fecha para calcular características temporales
+df = df.sort_values(by=['cc_num', 'trans_date_trans_time'])
 
-numeric_vars = ['amt', 'distance_km', 'age', 'city_pop']
-normality_results = {}
-for col in numeric_vars:
-    # Usamos muestra de 5000 para no saturar
-    stat, p = stats.kstest(df[col].dropna().sample(5000, random_state=42), 'norm')
-    is_normal = p > 0.05
-    normality_results[col] = "Normal" if is_normal else "No Normal"
-    print(f"Variable '{col}': p-value={p:.4f} -> {normality_results[col]}")
+# Features de Velocidad
+df_temp = df.set_index('trans_date_trans_time')
+df['trans_count_24h'] = df_temp.groupby('cc_num')['amt'].rolling('24h').count().values
+df['avg_amt_last_5'] = df.groupby('cc_num')['amt'].transform(lambda x: x.rolling(5, min_periods=1).mean())
+df['diff_from_avg'] = df['amt'] - df['avg_amt_last_5']
 
-# Asignacion segun normalidad
-if any(res == "No Normal" for res in normality_results.values()):
-    method_corr = "spearman"
-    print("\n>>> CONCLUSIÓN: Se detectaron variables NO normales. Usaremos correlación de SPEARMAN.")
-else:
-    method_corr = "pearson"
-    print("\n>>> CONCLUSIÓN: Todo es normal. Usaremos correlación de PEARSON.")
-
-print(f"\n--- Matriz de correlacion ({method_corr.upper()}) ---")
-
-# ======================== Correlacion 
-cols_corr = ['amt', 'age', 'distance_km', 'city_pop', 'lat', 'long', 'merch_lat', 'merch_long', 'zip', 'hour']
-corr_matrix = df[cols_corr].corr(method=method_corr)
-plt.figure(figsize=(10, 8))
-sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', fmt=".2f", vmin=-1, vmax=1)
-plt.title(f'Matriz de Correlación ({method_corr.capitalize()})')
-plt.savefig('3. credit_fraud/correlation_matrix.png')
-plt.close()
-
-# ======================== Pruebas de hipotesis estadisticas 
-print("\n--- PRUEBAS DE SIGNIFICANCIA ---")
-
-# Variables numericas (Mann-Whitney U)
-print("Numéricas: Mann-Whitney U Test")
-fraude = df[df['is_fraud'] == 1]
-no_fraude = df[df['is_fraud'] == 0]
-
-stats_results = []
-for col in ['amt', 'distance_km', 'age', 'city_pop', 'lat', 'long', 'merch_lat', 'merch_long', 'zip', 'hour']:
-    stat, p = stats.mannwhitneyu(fraude[col], no_fraude[col])
-    diff_mediana = fraude[col].median() - no_fraude[col].median()
-    stats_results.append({
-        'Variable': col,
-        'P-Value': p,
-        'Es Significativo?': 'SÍ' if p < 0.05 else 'NO',
-        'Diferencia Medianas': diff_mediana
-    })
-
-print(pd.DataFrame(stats_results))
-
-# Variables categoricas (Chi-Cuadrado)
-print("\nCategóricas: Chi-Cuadrado de Independencia")
-for col in ['gender', 'category', 'state', 'job', 'day_of_week']:
-    contingency = pd.crosstab(df[col], df['is_fraud'])
-    chi2, p, dof, ex = stats.chi2_contingency(contingency)
-    print(f"Variable '{col}': p-value={p:.4e} -> {'Significativo' if p < 0.05 else 'Independiente (Borrar)'}")
-
-# =================== Eliminar variables ===================
-
-df.drop(columns=["first","last","gender","street","dob","unix_time","city","state","sn","merchant","trans_num","cc_num","trans_date_trans_time", "long", "merch_long", 'distance_km','zip'],inplace=True)
 
 # Codificar variable categóricas
 le = LabelEncoder()
-cat_cols_toEncode = ["category", "day_of_week", "job"]  
+cat_cols_toEncode = ["category",'day_of_week']  
 for col in cat_cols_toEncode:
     if col in df.columns:   
         df[col] = le.fit_transform(df[col])
+        
+df = df.sort_values(by=['trans_date_trans_time'])
 
-# DEFINICIÓN DE X e Y
+# =================== Eliminar variables ===================
+cols_to_drop = ["first","last","gender","street","dob","unix_time","city","state",
+                "sn","merchant","trans_num","cc_num","trans_date_trans_time", 
+                "long", "merch_long", 'zip', 'city_pop', 'job']
+
+df.drop(columns=cols_to_drop, inplace=True)
+
+# Definimos DE X e Y
 X = df.drop(columns=["is_fraud"])
 Y = df["is_fraud"] 
 
-# ================== PRE-PROCESAMIENTO
-x_train_global, x_test_global, y_train_global, y_test_global = train_test_split(
+# ================= Split Temporal =================
+'''
+# Si balanceamos con stratify, el modelo no aprende a detectar fraudes porque el dataset es muy pequeño y el 99% de las transacciones son buenas.
+X_train, X_test, y_train, y_test = train_test_split(
     X, Y, 
     test_size=0.2, 
     random_state=42, 
     stratify=Y)
 
-sc = StandardScaler()
-x_train_sc = sc.fit_transform(x_train_global)
-x_test_sc = sc.transform(x_test_global)
-
-# Under Sampling 
-us = RandomUnderSampler(random_state=42)
-x_train_us, y_train_us = us.fit_resample(x_train_sc, y_train_global)
-print(f"Dimensiones UnderSampling Train: {x_train_us.shape}")
-
-# Over Sampling SMOTE
-sm = SMOTE(random_state=42)
-x_train_sm, y_train_sm = sm.fit_resample(x_train_sc, y_train_global)
-print(f"Dimensiones SMOTE Train: {x_train_sm.shape}")
-print("-" * 50)
-
-# ============================= Logistic Regression con class_weight='balanced'
-print("\n--- Logistic Regression con class_weight='balanced' ---")
-
-lr_bal = LogisticRegression(class_weight="balanced", max_iter=1000, random_state=42)
-lr_bal.fit(x_train_sc, y_train_global) 
-y_pred_bal = lr_bal.predict(x_test_sc)
-
-print(confusion_matrix(y_test_global, y_pred_bal))
-print("Precision:", precision_score(y_test_global, y_pred_bal)*100)
-print("Recall:", recall_score(y_test_global, y_pred_bal)*100)
-print("F1:", f1_score(y_test_global, y_pred_bal)*100)
-
-'''
-# PROBAR DIFERENTES UMBRALES DE DECISION
-y_proba = lr_bal.predict_proba(x_test_sc)[:,1] # Corregido para usar el sc
-
-for t in [0.1, 0.2, 0.3, 0.4, 0.5]:
-    y_pred_t = (y_proba >= t).astype(int)
-    print(f"\nThreshold = {t}")
-    print("Precision:", precision_score(y_test_global, y_pred_t)*100)
-    print("Recall:", recall_score(y_test_global, y_pred_t)*100)
-    print("F1:", f1_score(y_test_global, y_pred_t)*100)
+scaler_full = StandardScaler()
+X_train_full_sc = scaler_full.fit_transform(X_train)
+X_test_full_sc = scaler_full.transform(X_test)
 '''
 
-# ============================= Logistic Regression con Under Sampling
-print("\n--- Logistic Regression con Under Sampling ---")
+# Definir el punto de corte usar el último 20% del tiempo para test)
+split_idx = int(len(df) * 0.8)
+X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+y_train, y_test = Y.iloc[:split_idx], Y.iloc[split_idx:]
 
-lr_us = LogisticRegression(max_iter=1000)
-lr_us.fit(x_train_us, y_train_us)
+# Arboles de deicision y random forest no necesitan escalado, pero para la red neuronal si es recomendable
+# Usamos RobustScaler para reducir el impacto de outliers, que son comunes en datos de fraude
+scaler_full = RobustScaler()
+X_train_full_sc = scaler_full.fit_transform(X_train)
+X_test_full_sc = scaler_full.transform(X_test)
 
-y_pred_us = lr_us.predict(x_test_sc) 
-cf = confusion_matrix(y_test_global, y_pred_us)
-
-print(cf)
-# sns.heatmap(cf, annot=True, fmt='d') 
-# plt.show()
-
-print("Precision:", precision_score(y_test_global, y_pred_us)*100)
-print("Recall:", recall_score(y_test_global, y_pred_us)*100)
-print("F1 Score:", f1_score(y_test_global, y_pred_us)*100)
-
-# ============================= Logistic Regression con Over Sampling (SMOTE)
-print("\n--- Logistic Regression con Over Sampling (SMOTE) ---")
-
-# Usamos los datos ya preparados arriba (x_train_sm)
-lr_smote = LogisticRegression(max_iter=1000, random_state=42)
-lr_smote.fit(x_train_sm, y_train_sm)
-
-y_pred_smote = lr_smote.predict(x_test_sc) # Evaluamos en el test real
-cf_2 = confusion_matrix(y_test_global, y_pred_smote)
-
-print(cf_2)
-# sns.heatmap(cf_2, annot=True, fmt='d', cmap='Greens')
-# plt.show()
-
-print("Precision:", precision_score(y_test_global, y_pred_smote)*100)
-print("Recall:", recall_score(y_test_global, y_pred_smote)*100)
-print("F1 Score:", f1_score(y_test_global, y_pred_smote)*100)
-
-# ============================= Estudios con Decision Tree Classifier
-
-# =========== Con class_weight='balanced'
+# =========== DECISION TREE CLASSIFIER CON CLASS WEIGHT BALANCED ===========
 print("\n--- Decision Tree Classifier con class_weight='balanced' ---")
 dt_bal = DecisionTreeClassifier(class_weight="balanced", random_state=42)
-dt_bal.fit(x_train_sc, y_train_global)
-y_pred_dt = dt_bal.predict(x_test_sc)
+dt_bal.fit(X_train_full_sc, y_train)
+y_pred_dt = dt_bal.predict(X_test_full_sc)
 
-print(confusion_matrix(y_test_global, y_pred_dt))
-print("Precision:", precision_score(y_test_global, y_pred_dt)*100)
-print("Recall:", recall_score(y_test_global, y_pred_dt)*100)
-print("F1:", f1_score(y_test_global, y_pred_dt)*100)
+print(confusion_matrix(y_test, y_pred_dt))
+print("Precision:", precision_score(y_test, y_pred_dt)*100)
+print("Recall:", recall_score(y_test, y_pred_dt)*100)
+print("F1:", f1_score(y_test, y_pred_dt)*100)
 
-# =========== Under sampling
-print("\n--- Decision Tree Classifier con Under Sampling ---")
-dt_u = DecisionTreeClassifier(random_state=42) 
-dt_u.fit(x_train_us, y_train_us)
-y_pred_dt_u = dt_u.predict(x_test_sc)
-
-print(confusion_matrix(y_test_global, y_pred_dt_u))
-print("Precision:", precision_score(y_test_global, y_pred_dt_u)*100)
-print("Recall:", recall_score(y_test_global, y_pred_dt_u)*100)
-print("F1 Score:", f1_score(y_test_global, y_pred_dt_u)*100)
-
-# =========== Over sampling (SMOTE)
-print("\n--- Decision Tree Classifier con Over Sampling ---")
-dt_s = DecisionTreeClassifier(random_state=42) 
-dt_s.fit(x_train_sm, y_train_sm)
-y_pred_dt_s = dt_s.predict(x_test_sc)
-
-print(confusion_matrix(y_test_global, y_pred_dt_s))
-print("Precision:", precision_score(y_test_global, y_pred_dt_s)*100)
-print("Recall:", recall_score(y_test_global, y_pred_dt_s)*100)
-print("F1 Score:", f1_score(y_test_global, y_pred_dt_s)*100)
-
-#  ============================= Comparacion con una neurona clasificadora 
-
-algoritmos_optimizacion = {
-        'RMSprop': RMSprop(learning_rate=0.001),
-        'Adam': Adam(learning_rate=0.001),
-        'Lamb': Lamb(learning_rate=0.001) 
-        }
-
-resultados_keras = []
-
-print("\n--- Entrenando Redes Neuronales (Under Sampling) ---")
-for nombre_opt, optimizador in algoritmos_optimizacion.items():
-    print(f'\nEntrenando con optimizador: {nombre_opt}')
-
-    model_under = keras.Sequential([
-        layers.Dense(64, activation='relu', input_shape=(x_train_us.shape[1],)),
-        layers.Dropout(0.3),
-        layers.Dense(32, activation='relu'),
-        layers.Dense(1, activation='sigmoid')
-    ])
-
-    model_under.compile(optimizer=optimizador,
-                loss='binary_crossentropy',
-                metrics=['accuracy'])
-
-    model_under.fit(x_train_us,
-                    y_train_us,
-            epochs=50, 
-            batch_size=32,
-            validation_split=0.2,
-            verbose=0
-            )
-
-    loss, accuracy = model_under.evaluate(x_test_sc, y_test_global, verbose=0)
-    print(f"Resultado {nombre_opt} - Pérdida: {loss:.4f}, Accuracy: {accuracy*100:.2f}%")
-
-    # Predicciones
-    y_pred_keras = (model_under.predict(x_test_sc) > 0.5).astype("int32")
-
-    resultados_keras.append({
-        'Optimizador': nombre_opt,
-        'Pérdida': loss,
-        'Precisión (Acc)': accuracy * 100,
-        'Precision': precision_score(y_test_global, y_pred_keras)*100,
-        'Recall': recall_score(y_test_global, y_pred_keras)*100,
-        'F1 Score': f1_score(y_test_global, y_pred_keras)*100
-    })
-
-# Imprimir tabla comparativa final
-print("\n--- Resultados Comparativos de Optimizadores (Keras) ---")
-print(pd.DataFrame(resultados_keras))
-
-# ================== RANDOM FOREST CLASSIFIER CON CLASS WEIGHT BALANCED
-print("\n--- Random Forest con Class Weight Balanced ---")
-
-# Usamos los datos globales (x_train_sc) que ya están escalados y divididos correctamente
-rf_model = RandomForestClassifier(
+# =================== Random Forest Classifier ===================
+print("\n--- Random Forest Classifier con class_weight='balanced' ---")
+rf_model = RandomForestClassifier( 
     n_estimators=100, 
-    class_weight='balanced', 
-    random_state=42,
-    max_depth=10, 
-    n_jobs=-1
-)
-rf_model.fit(x_train_sc, y_train_global)
-y_pred_rf = rf_model.predict(x_test_sc)
-
-print(confusion_matrix(y_test_global, y_pred_rf))
-print(classification_report(y_test_global, y_pred_rf))
-print("Precision:", precision_score(y_test_global, y_pred_rf)*100)
-print("Recall:", recall_score(y_test_global, y_pred_rf)*100)
-print("F1 Score:", f1_score(y_test_global, y_pred_rf)*100)
-
-
-print("\n--- Red Neuronal con Class Weights ---")
-weights = class_weight.compute_class_weight(
     class_weight='balanced',
-    classes=np.unique(y_train_global),
-    y=y_train_global
-)
-dict_weights = {0: weights[0], 1: weights[1]}
+    random_state=42, 
+    n_jobs=-1 )
 
-model_weighted = keras.Sequential([
-    layers.Input(shape=(x_train_sc.shape[1],)),
-    layers.Dense(32, activation='relu'),
-    layers.BatchNormalization(), # Estabiliza el aprendizaje
-    layers.Dropout(0.2),
-    layers.Dense(16, activation='relu'),
-    layers.Dense(1, activation='sigmoid')
+rf_model.fit(X_train_full_sc, y_train)
+
+# Iteramos sobre varios thresholds y evaluamos
+for threshold in [0.3, 0.5, 0.7]:
+    print(f"\n--- Threshold: {threshold} ---")
+    y_proba_rf = rf_model.predict_proba(X_test_full_sc)[:, 1]
+    y_pred_rf_thresh = (y_proba_rf > threshold).astype(int)
+    print(confusion_matrix(y_test, y_pred_rf_thresh))
+    print(classification_report(y_test, y_pred_rf_thresh))
+    print("Precision:", precision_score(y_test, y_pred_rf_thresh)*100)
+    print("Recall:", recall_score(y_test, y_pred_rf_thresh)*100)
+    print("F1 Score:", f1_score(y_test, y_pred_rf_thresh)*100)
+
+# Curva ROC
+fpr, tpr, roc_thresholds = roc_curve(y_test, y_proba_rf)
+roc_auc = roc_auc_score(y_test, y_proba_rf)
+plt.figure()
+plt.plot(fpr, tpr, label=f"ROC AUC = {roc_auc:.3f}")
+plt.plot([0, 1], [0, 1], linestyle="--")
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate (Recall)")
+plt.title("ROC Curve - Random Forest")
+plt.legend()
+plt.savefig("3. credit_fraud/roc_curve_rf.png")
+plt.show()
+plt.close()
+
+# Curva Precision-Recall
+precision, recall, pr_thresholds = precision_recall_curve(y_test, y_proba_rf)
+ap_score = average_precision_score(y_test, y_proba_rf)
+plt.figure()
+plt.plot(recall, precision, label=f"AP = {ap_score:.3f}")
+plt.xlabel("Recall")
+plt.ylabel("Precision")
+plt.title("Precision–Recall Curve - Random Forest")
+plt.legend()
+plt.savefig("3. credit_fraud/precision_recall_curve_rf.png")
+plt.show()
+plt.close()
+
+# Importancia de características mediante Permutation Importance
+result = permutation_importance(
+    rf_model,
+    X_test_full_sc,
+    y_test,
+    n_repeats=10,
+    random_state=42,
+    scoring="average_precision"
+)
+
+importances = pd.DataFrame({
+    "feature": X.columns,
+    "importance_mean": result.importances_mean,
+    "importance_std": result.importances_std
+}).sort_values("importance_mean", ascending=False)
+
+plt.figure(figsize=(10,6))
+sns.barplot(
+    data=importances.head(15),
+    x="importance_mean",
+    y="feature",
+    orient="h"
+)
+plt.title("Permutation Feature Importance (Random Forest)")
+plt.xlabel("Decrease in F1-score")
+plt.ylabel("Feature")
+plt.savefig("3. credit_fraud/permutation_importance_rf.png")
+plt.show()
+
+# =================== Deep Neural Network ===================
+print("\n--- Deep Neural Network ---")
+
+# Debido al desbalance de clases, hay que ajustar el umbral de decisión
+negativo, positivo = np.bincount(y_train)
+initial_bias = np.log([positivo / negativo])
+# Calculamos class weights para el entrenamiento
+class_weights = {0: (1/negativo)*(len(y_train)/2.0), 1: (1/positivo)*(len(y_train)/2.0)}
+output_bias = tf.keras.initializers.Constant(initial_bias)
+
+model_dnn = keras.Sequential([
+    layers.Input(shape=(X_train_full_sc.shape[1],)),
+    
+    layers.Dense(256, activation='relu'),
+    layers.BatchNormalization(),
+    layers.Dropout(0.4),
+    
+    layers.Dense(128, activation='relu'),
+    layers.BatchNormalization(),
+    layers.Dropout(0.3),
+    
+    layers.Dense(64, activation='relu'),
+    layers.BatchNormalization(),
+    
+    # Corregimos el sesgo inicial para que el modelo empiece con una predicción más informada sobre la clase minoritaria
+    # Es decir, le damos una probabilidad inicial basada en la distribución de clases
+    #layers.Dense(1, activation='sigmoid', bias_initializer=output_bias)
+    
+    # Resulta que con el bias inicial el modelo no aprende a detectar fraudes, así que lo dejamos sin bias y con class weights
+    layers.Dense(1, activation='sigmoid') 
 ])
 
-model_weighted.compile(optimizer='adam', loss='binary_crossentropy', metrics=['AUC'])
-
-model_weighted.fit(
-    x_train_sc, y_train_global,
-    epochs=50,
-    batch_size=32, # Batch grande para que siempre haya algún fraude en cada paso
-    class_weight=dict_weights,
-    validation_split=0.1,
-    verbose=0
+model_dnn.compile(
+    optimizer=Adam(learning_rate=1e-3),
+    loss='binary_crossentropy',
+    metrics=[
+        metrics.Recall(name="recall"),
+        metrics.AUC(name="pr_auc", curve="PR")
+    ]
 )
 
-y_pred_nn = (model_weighted.predict(x_test_sc) > 0.5).astype(int)
-print(classification_report(y_test_global, y_pred_nn))
-print("Precision:", precision_score(y_test_global, y_pred_nn)*100)
-print("Recall:", recall_score(y_test_global, y_pred_nn)*100)
-print("F1 Score:", f1_score(y_test_global, y_pred_nn)*100)
+# Early stopping basado en PR AUC, para detener el entrenamiento cuando la métrica deje de mejorar
+early_stop = callbacks.EarlyStopping(
+    monitor='val_pr_auc', 
+    mode='max', 
+    patience=40, 
+    restore_best_weights=True
+)
 
+model_dnn.fit(
+    X_train_full_sc,
+    y_train,
+    epochs=1000,
+    batch_size=2048, # Usamos un batch grande para estabilizar el entrenamiento con datos desbalanceados
+    validation_split=0.2,
+    #class_weight=class_weights,
+    verbose=1,
+    callbacks=[early_stop]
+)
+
+y_proba_full = model_dnn.predict(X_test_full_sc).ravel()
+
+for threshold in [0.3, 0.5, 0.7]:
+    print(f"--- Threshold: {threshold} ---")
+    y_pred_thresh = (y_proba_full > threshold).astype(int)
+    print(confusion_matrix(y_test, y_pred_thresh))
+    print(classification_report(y_test, y_pred_thresh))
+    print(f"Precision: {precision_score(y_test, y_pred_thresh)*100:.2f}%")
+    print(f"Recall:    {recall_score(y_test, y_pred_thresh)*100:.2f}%")
+    print(f"F1 Score:  {f1_score(y_test, y_pred_thresh)*100:.2f}%")
+
+# Curva ROC
+fpr, tpr, roc_thresholds = roc_curve(y_test, y_proba_full)
+roc_auc = roc_auc_score(y_test, y_proba_full)
+plt.figure()
+plt.plot(fpr, tpr, label=f"ROC AUC = {roc_auc:.3f}")
+plt.plot([0, 1], [0, 1], linestyle="--")
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate (Recall)")
+plt.title("ROC Curve - Deep Neural Network")
+plt.legend()
+plt.savefig("3. credit_fraud/roc_curve_dnn.png")
+plt.show()
+plt.close()
+
+# Curva Precision-Recall
+precision, recall, pr_thresholds = precision_recall_curve(y_test, y_proba_full)
+ap_score = average_precision_score(y_test, y_proba_full)
+plt.figure()
+plt.plot(recall, precision, label=f"AP = {ap_score:.3f}")
+plt.xlabel("Recall")
+plt.ylabel("Precision")
+plt.title("Precision–Recall Curve - Deep Neural Network")
+plt.legend()
+plt.savefig("3. credit_fraud/precision_recall_curve_dnn.png")
+plt.show()
+plt.close()
+
+'''
+def f1_scorer(y_true, y_pred_proba, threshold=0.5):
+    y_pred = (y_pred_proba >= threshold).astype(int)
+    return f1_score(y_true, y_pred)
+
+def permutation_importance_nn(model, X, y, threshold=0.5, n_repeats=5):
+    baseline = f1_scorer(y, model.predict(X).ravel(), threshold)
+    importances = []
+
+    for col in range(X.shape[1]):
+        scores = []
+        for _ in range(n_repeats):
+            X_permuted = X.copy()
+            np.random.shuffle(X_permuted[:, col])
+            score = f1_scorer(y, model.predict(X_permuted).ravel(), threshold)
+            scores.append(baseline - score)
+        importances.append(np.mean(scores))
+
+    return np.array(importances)
+
+# Evaluamos la 
+nn_importances = permutation_importance_nn(
+    model_dnn,
+    X_test_full_sc,
+    y_test,
+    threshold=0.5,
+    n_repeats=2
+)
+
+nn_importance_df = pd.DataFrame({
+    "feature": X.columns,
+    "importance": nn_importances
+}).sort_values("importance", ascending=False)
+
+plt.figure(figsize=(10,6))
+sns.barplot(
+    data=nn_importance_df.head(15),
+    x="importance",
+    y="feature",
+    orient="h"
+)
+plt.title("Permutation Feature Importance (Neural Network)")
+plt.xlabel("Decrease in F1-score")
+plt.ylabel("Feature")
+plt.savefig("3. credit_fraud/permutation_importance_dnn.png")
+plt.show()
+'''
 
